@@ -1,0 +1,193 @@
+import numpy as np
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+from torch.utils.data import DataLoader, Dataset
+import torch
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+# Load datasets
+train_path = '/content/LABELLED_TRAIN.csv'
+dev_path = '/content/LABELLED_DEV.csv'
+test_path = '/content/UNLABELLED_TEST.csv'
+
+# Load datasets into pandas DataFrames
+train_df = pd.read_csv(train_path)
+dev_df = pd.read_csv(dev_path)
+test_df = pd.read_csv(test_path)
+
+#train dataset
+print("Train Dataset Shape:", train_df.shape)
+print("Train Dataset Sample:")
+print(train_df.head())
+
+#development dataset
+print("Dev Dataset Shape:", dev_df.shape)
+print("Dev Dataset Sample:")
+print(dev_df.head())
+
+#test dataset
+print("Test Dataset Shape:", test_df.shape)
+print("Test Dataset Sample:")
+print(test_df.head())
+
+# Check for missing values in datasets
+print("\nMissing values in Train Dataset:\n", train_df.isnull().sum())
+print("\nMissing values in Dev Dataset:\n", dev_df.isnull().sum())
+print("\nMissing values in Test Dataset:\n", test_df.isnull().sum())
+
+# Visualize article length distribution
+train_df['article_length'] = train_df['News Article'].apply(lambda x: len(str(x).split()))
+plt.hist(train_df['article_length'], bins=30, color='blue', alpha=0.7)
+plt.title('Article Length Distribution in Training Data')
+plt.xlabel('Number of Words')
+plt.ylabel('Frequency')
+plt.show()
+
+# Preprocessing: Remove missing values if any
+train_df.dropna(inplace=True)
+dev_df.dropna(inplace=True)
+test_df.dropna(inplace=True)
+
+# Splitting articles and headlines for training
+X_train = train_df['News Article'].tolist()
+y_train = train_df['Caption'].tolist()
+
+# separate articles and headlines
+X_dev = dev_df['News Article'].tolist()
+y_dev = dev_df['Caption'].tolist()
+
+# Tokenizer and model initialization
+tokenizer = T5Tokenizer.from_pretrained('t5-small')
+model = T5ForConditionalGeneration.from_pretrained('t5-small')
+
+# Dataset class
+class HeadlineDataset(Dataset):
+    def __init__(self, articles, headlines, tokenizer, max_len=512):
+        self.articles = articles
+        self.headlines = headlines
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.articles)
+
+    def __getitem__(self, idx):
+        article = self.articles[idx]
+        headline = self.headlines[idx]
+        inputs = self.tokenizer.encode_plus(
+            article,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+        targets = self.tokenizer.encode_plus(
+            headline,
+            max_length=50,
+            padding='max_length',
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            'input_ids': inputs['input_ids'].squeeze(0),
+            'attention_mask': inputs['attention_mask'].squeeze(0),
+            'labels': targets['input_ids'].squeeze(0)
+        }
+
+# Prepare datasets and dataloaders
+train_dataset = HeadlineDataset(X_train, y_train, tokenizer)
+dev_dataset = HeadlineDataset(X_dev, y_dev, tokenizer)
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+dev_loader = DataLoader(dev_dataset, batch_size=8)
+
+def train_epoch(model, dataloader, optimizer, device):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(dataloader):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        loss = outputs.loss
+        total_loss += loss.item()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    return total_loss / len(dataloader)
+
+# Evaluation function
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            total_loss += outputs.loss.item()
+    return total_loss / len(dataloader)
+
+# Training setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+epochs = 3
+
+# Training loop
+for epoch in range(epochs):
+    print(f"Epoch {epoch + 1}/{epochs}")
+    train_loss = train_epoch(model, train_loader, optimizer, device)
+    val_loss = evaluate(model, dev_loader, device)
+    print(f"Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}")
+
+# Save the model
+model.save_pretrained("headline_model")
+tokenizer.save_pretrained("headline_model")
+
+#predictions on test set
+def generate_headlines(model, tokenizer, articles, device, max_len=50):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for article in tqdm(articles):
+            inputs = tokenizer.encode_plus(
+                article,
+                max_length=512,
+                padding='max_length',
+                truncation=True,
+                return_tensors="pt"
+            )
+            input_ids = inputs['input_ids'].to(device)
+            attention_mask = inputs['attention_mask'].to(device)
+
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_len,
+                num_beams=5,
+                early_stopping=True
+            )
+            predictions.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    return predictions
+
+test_articles = test_df['News Article'].tolist()
+predictions = generate_headlines(model, tokenizer, test_articles, device)
+
+# Save
+test_df['Prediction'] = predictions
+test_df[['ID', 'Prediction']].to_csv('predictions.csv', index=False)
+
+print("Predictions saved to predictions.csv")
